@@ -8,6 +8,12 @@
 #include "ObjectMgr.h"
 #include "QuestDef.h"
 #include "Log.h"
+#include "WorldSessionMgr.h"
+
+#if __has_include("PlayerbotAIConfig.h")
+#include "PlayerbotAIConfig.h"
+#define ABYSSAL_STORAGE_PLAYERBOTS
+#endif
 
 AbyssalPlayerData* GetAbyssalData(Player* player)
 {
@@ -16,10 +22,32 @@ AbyssalPlayerData* GetAbyssalData(Player* player)
     return player->CustomData.GetDefault<AbyssalPlayerData>("AbyssalData");
 }
 
+AbyssalPlayerData* FindAbyssalData(Player* player)
+{
+    if (!player)
+        return nullptr;
+    return player->CustomData.Get<AbyssalPlayerData>("AbyssalData");
+}
+
 AbyssalStorageMgr* AbyssalStorageMgr::instance()
 {
     static AbyssalStorageMgr instance;
     return &instance;
+}
+
+bool AbyssalStorageMgr::IsVaultUser(Player* player)
+{
+    if (!_enabled || !player || !player->GetSession())
+        return false;
+
+#ifdef ABYSSAL_STORAGE_PLAYERBOTS
+    // Random bots (addclass bots too) live on the rndbot accounts. Altbots are on the player's own
+    // account and do use its vault.
+    if (sPlayerbotAIConfig.IsInRandomAccountList(player->GetSession()->GetAccountId()))
+        return false;
+#endif
+
+    return true;
 }
 
 void AbyssalStorageMgr::LoadAccountData(uint32 accountId)
@@ -44,14 +72,9 @@ void AbyssalStorageMgr::LoadAccountData(uint32 accountId)
         } while (result->NextRow());
     }
 
+    // emplace, not assign: never replace a copy that is already in use
     std::lock_guard<std::mutex> lock(_storageMutex);
-    _storage[accountId] = std::move(items);
-}
-
-void AbyssalStorageMgr::UnloadAccountData(uint32 accountId)
-{
-    std::lock_guard<std::mutex> lock(_storageMutex);
-    _storage.erase(accountId);
+    _storage.emplace(accountId, std::move(items));
 }
 
 bool AbyssalStorageMgr::IsAccountLoaded(uint32 accountId)
@@ -60,19 +83,29 @@ bool AbyssalStorageMgr::IsAccountLoaded(uint32 accountId)
     return _storage.find(accountId) != _storage.end();
 }
 
-void AbyssalStorageMgr::DepositItem(uint32 accountId, uint32 itemEntry, uint32 count)
+// The DB writes below only add or subtract, never set a total. CharacterDatabase can run several
+// async worker threads, so writes may land out of order, and adding/subtracting still adds up.
+void AbyssalStorageMgr::DepositItem(uint32 accountId, uint32 itemEntry, uint32 count,
+    CharacterDatabaseTransaction trans)
 {
+    if (!count)
+        return;
+
     {
         std::lock_guard<std::mutex> lock(_storageMutex);
         _storage[accountId][itemEntry] += count;
     }
 
-    CharacterDatabase.Execute("INSERT INTO abyssal_storage (account_id, item_entry, count) VALUES ({}, {}, {}) "
+    trans->Append("INSERT INTO abyssal_storage (account_id, item_entry, count) VALUES ({}, {}, {}) "
         "ON DUPLICATE KEY UPDATE count = count + {}", accountId, itemEntry, count, count);
 }
 
-bool AbyssalStorageMgr::WithdrawItem(uint32 accountId, uint32 itemEntry, uint32 count)
+bool AbyssalStorageMgr::WithdrawItem(uint32 accountId, uint32 itemEntry, uint32 count,
+    CharacterDatabaseTransaction trans)
 {
+    if (!count)
+        return false;
+
     std::lock_guard<std::mutex> lock(_storageMutex);
 
     auto accIt = _storage.find(accountId);
@@ -84,19 +117,23 @@ bool AbyssalStorageMgr::WithdrawItem(uint32 accountId, uint32 itemEntry, uint32 
         return false;
 
     itemIt->second -= count;
-
     if (itemIt->second == 0)
-    {
         accIt->second.erase(itemIt);
-        CharacterDatabase.Execute("DELETE FROM abyssal_storage WHERE account_id = {} AND item_entry = {}", accountId, itemEntry);
-    }
-    else
-    {
-        CharacterDatabase.Execute("UPDATE abyssal_storage SET count = {} WHERE account_id = {} AND item_entry = {}",
-            itemIt->second, accountId, itemEntry);
-    }
+
+    trans->Append("UPDATE abyssal_storage SET count = count - {} "
+        "WHERE account_id = {} AND item_entry = {} AND count >= {}", count, accountId, itemEntry, count);
+    trans->Append("DELETE FROM abyssal_storage WHERE account_id = {} AND item_entry = {} AND count = 0",
+        accountId, itemEntry);
 
     return true;
+}
+
+// Without this, a crash before the next character save could leave an item in both the vault and
+// the bags, or in neither
+void AbyssalStorageMgr::CommitWithInventory(Player* player, CharacterDatabaseTransaction trans)
+{
+    player->SaveInventoryAndGoldToDB(trans);
+    CharacterDatabase.CommitTransaction(trans);
 }
 
 uint32 AbyssalStorageMgr::GetItemCount(uint32 accountId, uint32 itemEntry)
@@ -159,12 +196,14 @@ bool AbyssalStorageMgr::IsItemRequiredByActiveQuest(Player* player, uint32 itemI
     return reserved > 0 && player->GetItemCount(itemId) <= reserved;
 }
 
+bool AbyssalStorageMgr::IsVaultable(ItemTemplate const* itemTemplate) const
+{
+    return itemTemplate && (itemTemplate->Class == ITEM_CLASS_TRADE_GOODS || itemTemplate->Class == ITEM_CLASS_GEM);
+}
+
 bool AbyssalStorageMgr::ShouldAutoStore(Player* player, ItemTemplate const* itemTemplate)
 {
-    if (!itemTemplate)
-        return false;
-
-    if (itemTemplate->Class != ITEM_CLASS_TRADE_GOODS && itemTemplate->Class != ITEM_CLASS_GEM)
+    if (!IsVaultable(itemTemplate))
         return false;
 
     if (IsItemRequiredByActiveQuest(player, itemTemplate->ItemId))
@@ -273,14 +312,27 @@ void AbyssalStorageMgr::SendFullSync(Player* player)
     SendAddonMessage(player, msg);
 }
 
+// An altbot shares its owner's account and so its vault. Returns the owner's character when it
+// isn't the one that changed the vault, so their addon can be kept up to date too.
+static Player* GetOtherAccountPlayer(Player* player)
+{
+    WorldSession* session = sWorldSessionMgr->FindSession(player->GetSession()->GetAccountId());
+    Player* owner = session ? session->GetPlayer() : nullptr;
+    return owner != player ? owner : nullptr;
+}
+
 void AbyssalStorageMgr::SendItemUpdate(Player* player, uint32 itemEntry, uint32 count)
 {
     std::string msg = "UPD:" + std::to_string(itemEntry) + "," + std::to_string(count);
     SendAddonMessage(player, msg);
+    if (Player* owner = GetOtherAccountPlayer(player))
+        SendAddonMessage(owner, msg);
 }
 
 void AbyssalStorageMgr::SendItemDelete(Player* player, uint32 itemEntry)
 {
     std::string msg = "DEL:" + std::to_string(itemEntry);
     SendAddonMessage(player, msg);
+    if (Player* owner = GetOtherAccountPlayer(player))
+        SendAddonMessage(owner, msg);
 }
